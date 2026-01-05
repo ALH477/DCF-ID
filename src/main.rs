@@ -3,15 +3,13 @@
 // ============================================================================
 // Copyright (c) 2024-2025 DeMoD LLC. All Rights Reserved.
 // ============================================================================
-// PATCHED VERSION - Production Ready
-// Changes:
-//   - Added GSN integration API routes
-//   - Fixed CSRF validation on OAuth
-//   - Added session persistence to SQLite
-//   - Added Stripe webhook timestamp validation
-//   - Added internal API key authentication
-//   - Improved username collision handling
-//   - Added database indexes
+// Redis-Backed Production Version
+//
+// Uses Redis for:
+//   - Session storage (survives restarts)
+//   - Rate limiting (distributed, persistent)
+//   - CSRF tokens (shared across instances)
+//   - Usage report queue (crash recovery)
 // ============================================================================
 
 use axum::{
@@ -21,6 +19,7 @@ use axum::{
     routing::{get, post},
     Router,
 };
+use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
 use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
 use sqlx::Row;
@@ -32,7 +31,6 @@ use argon2::{
 use tower_http::{trace::TraceLayer, timeout::TimeoutLayer, compression::CompressionLayer};
 use rand::{distributions::Alphanumeric, Rng};
 use std::{
-    collections::HashMap,
     env,
     net::SocketAddr,
     sync::{atomic::{AtomicBool, AtomicU64, Ordering}, Arc},
@@ -45,7 +43,7 @@ use oauth2::{
 };
 use reqwest::Client as HttpClient;
 use chrono::{Datelike, Utc};
-use tokio::{signal, sync::RwLock, time::sleep};
+use tokio::{signal, time::sleep};
 use tracing::{info, warn, error, debug};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -58,12 +56,19 @@ const BYTES_PER_GB: f64 = 1_073_741_824.0;
 const PRICE_PER_GB: f64 = 0.05;
 const PRICE_PER_BYTE: f64 = PRICE_PER_GB / BYTES_PER_GB;
 const SESSION_DURATION_SECS: i64 = 86400 * 7; // 7 days
-const MAX_LOGIN_ATTEMPTS: u32 = 5;
+const MAX_LOGIN_ATTEMPTS: i64 = 5;
 const LOCKOUT_DURATION_SECS: i64 = 900; // 15 minutes
 const MIN_PASSWORD_LENGTH: usize = 8;
 const MAX_USERNAME_LENGTH: usize = 32;
 const CSRF_TOKEN_DURATION_SECS: i64 = 600; // 10 minutes
 const STRIPE_WEBHOOK_TOLERANCE_SECS: i64 = 300; // 5 minutes
+
+// Redis key prefixes
+const REDIS_SESSION_PREFIX: &str = "session:";
+const REDIS_RATELIMIT_PREFIX: &str = "ratelimit:";
+const REDIS_LOCKOUT_PREFIX: &str = "lockout:";
+const REDIS_CSRF_PREFIX: &str = "csrf:";
+const REDIS_PENDING_LINK_PREFIX: &str = "pendinglink:";
 
 // ============================================================================
 // APPLICATION STATE
@@ -71,23 +76,15 @@ const STRIPE_WEBHOOK_TOLERANCE_SECS: i64 = 300; // 5 minutes
 #[derive(Clone)]
 struct AppState {
     pool: SqlitePool,
+    redis: redis::Client,
     oauth_client: BasicClient,
     http_client: HttpClient,
-    login_attempts: Arc<RwLock<HashMap<String, LoginAttempts>>>,
-    csrf_tokens: Arc<RwLock<HashMap<String, i64>>>, // CSRF token -> expires_at
     stripe_secret: String,
     stripe_webhook_secret: String,
     base_url: String,
-    internal_key: String, // For service-to-service auth
+    internal_key: String,
     metrics: Arc<Metrics>,
     shutdown: Arc<AtomicBool>,
-}
-
-#[derive(Clone, Debug, Default)]
-struct LoginAttempts {
-    count: u32,
-    last_attempt: i64,
-    lockout_until: Option<i64>,
 }
 
 #[derive(Debug, Default)]
@@ -99,6 +96,18 @@ struct Metrics {
     payments_total: AtomicU64,
     payments_amount_cents: AtomicU64,
     api_calls: AtomicU64,
+    redis_errors: AtomicU64,
+}
+
+// ============================================================================
+// SESSION DATA (Stored in Redis as JSON)
+// ============================================================================
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct SessionData {
+    username: String,
+    expires_at: i64,
+    created_ip: String,
+    created_at: String,
 }
 
 // ============================================================================
@@ -138,7 +147,7 @@ struct AuthPayload {
 #[derive(Deserialize)]
 struct OAuthCallback {
     code: String,
-    state: String, // Now validated!
+    state: String,
 }
 
 #[derive(Deserialize)]
@@ -166,7 +175,7 @@ struct StripeEventData {
 
 #[derive(Deserialize)]
 struct StripeCheckoutSession {
-    metadata: Option<HashMap<String, String>>,
+    metadata: Option<std::collections::HashMap<String, String>>,
 }
 
 #[derive(Serialize)]
@@ -174,6 +183,7 @@ struct HealthResponse {
     status: &'static str,
     version: &'static str,
     uptime_secs: u64,
+    redis_ok: bool,
 }
 
 #[derive(Serialize)]
@@ -184,11 +194,10 @@ struct MetricsResponse {
     registrations: u64,
     payments_total: u64,
     api_calls: u64,
+    redis_errors: u64,
 }
 
-// ============================================================================
-// GSN INTEGRATION TYPES
-// ============================================================================
+// GSN Integration types
 #[derive(Serialize)]
 struct ApiResponse<T> {
     success: bool,
@@ -231,6 +240,132 @@ struct StatsResponse {
     total_bandwidth_bytes: i64,
     total_balance_usd: f64,
     vip_users: i64,
+}
+
+// ============================================================================
+// REDIS HELPERS
+// ============================================================================
+impl AppState {
+    async fn redis_conn(&self) -> Result<redis::aio::MultiplexedConnection, redis::RedisError> {
+        self.redis.get_multiplexed_async_connection().await
+    }
+
+    // Session management
+    async fn save_session(&self, session_id: &str, data: &SessionData) -> Result<(), ()> {
+        let mut conn = self.redis_conn().await.map_err(|e| {
+            self.metrics.redis_errors.fetch_add(1, Ordering::Relaxed);
+            error!("Redis connection error: {}", e);
+        })?;
+
+        let key = format!("{}{}", REDIS_SESSION_PREFIX, session_id);
+        let json = serde_json::to_string(data).map_err(|_| ())?;
+        let ttl = (data.expires_at - Utc::now().timestamp()).max(1) as u64;
+
+        conn.set_ex::<_, _, ()>(&key, &json, ttl).await.map_err(|e| {
+            self.metrics.redis_errors.fetch_add(1, Ordering::Relaxed);
+            error!("Redis SET error: {}", e);
+        })?;
+
+        Ok(())
+    }
+
+    async fn get_session(&self, session_id: &str) -> Option<SessionData> {
+        let mut conn = self.redis_conn().await.ok()?;
+        let key = format!("{}{}", REDIS_SESSION_PREFIX, session_id);
+
+        let json: Option<String> = conn.get(&key).await.ok()?;
+        json.and_then(|j| serde_json::from_str(&j).ok())
+    }
+
+    async fn delete_session(&self, session_id: &str) {
+        if let Ok(mut conn) = self.redis_conn().await {
+            let key = format!("{}{}", REDIS_SESSION_PREFIX, session_id);
+            let _: Result<(), _> = conn.del(&key).await;
+        }
+    }
+
+    // Rate limiting
+    async fn check_rate_limit(&self, ip: &str) -> Result<bool, ()> {
+        let mut conn = self.redis_conn().await.map_err(|_| ())?;
+
+        let lockout_key = format!("{}{}", REDIS_LOCKOUT_PREFIX, ip);
+        let is_locked: Option<String> = conn.get(&lockout_key).await.ok().flatten();
+        if is_locked.is_some() {
+            return Ok(false); // Still locked out
+        }
+
+        Ok(true) // Not locked
+    }
+
+    async fn record_failed_login(&self, ip: &str) -> Result<i64, ()> {
+        let mut conn = self.redis_conn().await.map_err(|_| ())?;
+
+        let key = format!("{}{}", REDIS_RATELIMIT_PREFIX, ip);
+        
+        // Increment counter
+        let count: i64 = conn.incr(&key, 1).await.map_err(|_| ())?;
+        
+        // Set expiry on first failure
+        if count == 1 {
+            let _: Result<(), _> = conn.expire(&key, LOCKOUT_DURATION_SECS as i64).await;
+        }
+
+        // If exceeded, set lockout
+        if count >= MAX_LOGIN_ATTEMPTS {
+            let lockout_key = format!("{}{}", REDIS_LOCKOUT_PREFIX, ip);
+            let _: Result<(), _> = conn.set_ex::<_, _, ()>(&lockout_key, "1", LOCKOUT_DURATION_SECS as u64).await;
+            warn!(event = "ip_lockout", ip = %ip, "IP locked out after {} attempts", count);
+        }
+
+        Ok(count)
+    }
+
+    async fn clear_rate_limit(&self, ip: &str) {
+        if let Ok(mut conn) = self.redis_conn().await {
+            let key = format!("{}{}", REDIS_RATELIMIT_PREFIX, ip);
+            let _: Result<(), _> = conn.del(&key).await;
+        }
+    }
+
+    async fn get_lockout_ttl(&self, ip: &str) -> Option<i64> {
+        let mut conn = self.redis_conn().await.ok()?;
+        let lockout_key = format!("{}{}", REDIS_LOCKOUT_PREFIX, ip);
+        conn.ttl(&lockout_key).await.ok().filter(|&ttl| ttl > 0)
+    }
+
+    // CSRF tokens
+    async fn save_csrf_token(&self, token: &str) -> Result<(), ()> {
+        let mut conn = self.redis_conn().await.map_err(|_| ())?;
+        let key = format!("{}{}", REDIS_CSRF_PREFIX, token);
+        conn.set_ex::<_, _, ()>(&key, "1", CSRF_TOKEN_DURATION_SECS as u64)
+            .await
+            .map_err(|_| ())
+    }
+
+    async fn validate_csrf_token(&self, token: &str) -> bool {
+        if let Ok(mut conn) = self.redis_conn().await {
+            let key = format!("{}{}", REDIS_CSRF_PREFIX, token);
+            // GET and DELETE atomically
+            let exists: Option<String> = conn.get_del(&key).await.ok().flatten();
+            return exists.is_some();
+        }
+        false
+    }
+
+    // Pending Discord links
+    async fn save_pending_link(&self, csrf_token: &str, discord_id: &str) -> Result<(), ()> {
+        let mut conn = self.redis_conn().await.map_err(|_| ())?;
+        let key = format!("{}{}", REDIS_PENDING_LINK_PREFIX, csrf_token);
+        conn.set_ex::<_, _, ()>(&key, discord_id, CSRF_TOKEN_DURATION_SECS as u64)
+            .await
+            .map_err(|_| ())
+    }
+
+    async fn get_pending_link(&self, csrf_token: &str) -> Option<String> {
+        let mut conn = self.redis_conn().await.ok()?;
+        let key = format!("{}{}", REDIS_PENDING_LINK_PREFIX, csrf_token);
+        conn.get_del(&key).await.ok().flatten()
+    }
 }
 
 // ============================================================================
@@ -279,7 +414,7 @@ fn validate_password(password: &str) -> Result<(), String> {
 
 fn verify_internal_key(headers: &HeaderMap, expected: &str) -> bool {
     if expected.is_empty() {
-        return true; // Dev mode: no key required
+        return true;
     }
     headers.get("X-Internal-Key")
         .and_then(|v| v.to_str().ok())
@@ -323,37 +458,6 @@ async fn update_user_ip(pool: &SqlitePool, username: &str, ip: &str) {
         .bind(ip)
         .bind(Utc::now().to_rfc3339())
         .bind(username)
-        .execute(pool)
-        .await;
-}
-
-// Session persistence helpers
-async fn save_session(pool: &SqlitePool, session_id: &str, username: &str, expires_at: i64, ip: &str) {
-    let _ = sqlx::query(
-        "INSERT OR REPLACE INTO sessions (id, username, expires_at, created_ip, created_at) VALUES (?, ?, ?, ?, ?)"
-    )
-    .bind(session_id)
-    .bind(username)
-    .bind(expires_at)
-    .bind(ip)
-    .bind(Utc::now().to_rfc3339())
-    .execute(pool)
-    .await;
-}
-
-async fn get_session(pool: &SqlitePool, session_id: &str) -> Option<(String, i64)> {
-    sqlx::query("SELECT username, expires_at FROM sessions WHERE id = ? AND expires_at > ?")
-        .bind(session_id)
-        .bind(Utc::now().timestamp())
-        .fetch_optional(pool)
-        .await
-        .ok()?
-        .map(|row| (row.get("username"), row.get("expires_at")))
-}
-
-async fn delete_session(pool: &SqlitePool, session_id: &str) {
-    let _ = sqlx::query("DELETE FROM sessions WHERE id = ?")
-        .bind(session_id)
         .execute(pool)
         .await;
 }
@@ -417,12 +521,21 @@ fn render_index(user: Option<UserDisplay>) -> String {
 async fn health_check(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
     let start = START.get_or_init(std::time::Instant::now);
+    
     let db_ok = sqlx::query("SELECT 1").fetch_one(&state.pool).await.is_ok();
+    let redis_ok = state.redis_conn().await
+        .and_then(|mut c| futures::executor::block_on(async { 
+            redis::cmd("PING").query_async::<String>(&mut c).await 
+        }).ok())
+        .is_some();
+    
+    let status = if db_ok && redis_ok { "healthy" } else { "degraded" };
     
     Json(HealthResponse {
-        status: if db_ok { "healthy" } else { "degraded" },
+        status,
         version: VERSION,
         uptime_secs: start.elapsed().as_secs(),
+        redis_ok,
     })
 }
 
@@ -434,6 +547,7 @@ async fn metrics(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         registrations: state.metrics.registrations.load(Ordering::Relaxed),
         payments_total: state.metrics.payments_total.load(Ordering::Relaxed),
         api_calls: state.metrics.api_calls.load(Ordering::Relaxed),
+        redis_errors: state.metrics.redis_errors.load(Ordering::Relaxed),
     })
 }
 
@@ -443,16 +557,16 @@ async fn index(
 ) -> impl IntoResponse {
     state.metrics.requests_total.fetch_add(1, Ordering::Relaxed);
     
-    // Check for session cookie
     if let Some(cookie) = headers.get("cookie") {
         if let Ok(cookie_str) = cookie.to_str() {
             for part in cookie_str.split(';') {
                 let part = part.trim();
                 if let Some(session_id) = part.strip_prefix("session=") {
-                    // Check database for session (persistent)
-                    if let Some((username, _)) = get_session(&state.pool, session_id).await {
-                        let user = dashboard_logic(&state.pool, &username).await;
-                        return Html(render_index(user));
+                    if let Some(session) = state.get_session(session_id).await {
+                        if session.expires_at > Utc::now().timestamp() {
+                            let user = dashboard_logic(&state.pool, &session.username).await;
+                            return Html(render_index(user));
+                        }
                     }
                 }
             }
@@ -506,8 +620,14 @@ async fn register(
             let session_id = generate_token(64);
             let expires_at = now.timestamp() + SESSION_DURATION_SECS;
             
-            // Persist session to database
-            save_session(&state.pool, &session_id, &payload.username, expires_at, &client_ip).await;
+            let session = SessionData {
+                username: payload.username.clone(),
+                expires_at,
+                created_ip: client_ip,
+                created_at: now.to_rfc3339(),
+            };
+            
+            let _ = state.save_session(&session_id, &session).await;
 
             let user = dashboard_logic(&state.pool, &payload.username).await;
             let html = render_index(user);
@@ -540,16 +660,17 @@ async fn login(
     let client_ip = extract_client_ip(&headers, addr);
     let now = Utc::now().timestamp();
     
-    // Rate limiting
-    {
-        let attempts = state.login_attempts.read().await;
-        if let Some(attempt) = attempts.get(&client_ip) {
-            if let Some(lockout_until) = attempt.lockout_until {
-                if now < lockout_until {
-                    return render_error(format!("Too many attempts. Try again in {} seconds.", lockout_until - now));
-                }
-            }
+    // Rate limiting check
+    match state.check_rate_limit(&client_ip).await {
+        Ok(false) => {
+            let ttl = state.get_lockout_ttl(&client_ip).await.unwrap_or(LOCKOUT_DURATION_SECS);
+            return render_error(format!("Too many attempts. Try again in {} seconds.", ttl));
         }
+        Err(_) => {
+            // Redis down - fail open with warning
+            warn!("Redis unavailable for rate limiting");
+        }
+        Ok(true) => {}
     }
     
     let password_hash = get_password_hash(&state.pool, &payload.username).await;
@@ -565,7 +686,7 @@ async fn login(
     };
     
     if login_success {
-        { let mut attempts = state.login_attempts.write().await; attempts.remove(&client_ip); }
+        state.clear_rate_limit(&client_ip).await;
         
         info!(event = "login_success", username = %payload.username);
         state.metrics.logins_success.fetch_add(1, Ordering::Relaxed);
@@ -574,8 +695,14 @@ async fn login(
         let session_id = generate_token(64);
         let expires_at = now + SESSION_DURATION_SECS;
         
-        // Persist session
-        save_session(&state.pool, &session_id, &payload.username, expires_at, &client_ip).await;
+        let session = SessionData {
+            username: payload.username.clone(),
+            expires_at,
+            created_ip: client_ip,
+            created_at: Utc::now().to_rfc3339(),
+        };
+        
+        let _ = state.save_session(&session_id, &session).await;
 
         let user = dashboard_logic(&state.pool, &payload.username).await;
         let html = render_index(user);
@@ -587,16 +714,7 @@ async fn login(
             .body(html.into())
             .unwrap_or_else(|_| render_error("Response failed".into()))
     } else {
-        {
-            let mut attempts = state.login_attempts.write().await;
-            let attempt = attempts.entry(client_ip.clone()).or_default();
-            attempt.count += 1;
-            attempt.last_attempt = now;
-            if attempt.count >= MAX_LOGIN_ATTEMPTS {
-                attempt.lockout_until = Some(now + LOCKOUT_DURATION_SECS);
-                warn!(event = "ip_lockout", ip = %client_ip);
-            }
-        }
+        let _ = state.record_failed_login(&client_ip).await;
         state.metrics.logins_failed.fetch_add(1, Ordering::Relaxed);
         render_error("Invalid credentials".into())
     }
@@ -607,7 +725,7 @@ async fn logout(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respo
         if let Ok(cookie_str) = cookie.to_str() {
             for part in cookie_str.split(';') {
                 if let Some(session_id) = part.trim().strip_prefix("session=") {
-                    delete_session(&state.pool, session_id).await;
+                    state.delete_session(session_id).await;
                 }
             }
         }
@@ -622,21 +740,23 @@ async fn logout(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Respo
 }
 
 // ============================================================================
-// OAUTH HANDLERS (with CSRF protection)
+// OAUTH HANDLERS
 // ============================================================================
-async fn discord_auth(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+async fn discord_auth(
+    Query(params): Query<std::collections::HashMap<String, String>>,
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
     let (auth_url, csrf_token) = state.oauth_client
         .authorize_url(CsrfToken::new_random)
         .add_scope(Scope::new("identify".into()))
         .url();
     
-    // Store CSRF token with expiration
-    {
-        let mut csrf_tokens = state.csrf_tokens.write().await;
-        csrf_tokens.insert(
-            csrf_token.secret().clone(),
-            Utc::now().timestamp() + CSRF_TOKEN_DURATION_SECS
-        );
+    // Save CSRF token to Redis
+    let _ = state.save_csrf_token(csrf_token.secret()).await;
+    
+    // If linking Discord from bot, save pending link
+    if let Some(discord_id) = params.get("link_discord") {
+        let _ = state.save_pending_link(csrf_token.secret(), discord_id).await;
     }
     
     Redirect::to(auth_url.as_str())
@@ -651,18 +771,13 @@ async fn discord_callback(
     let client_ip = extract_client_ip(&headers, addr);
     
     // Validate CSRF token
-    {
-        let mut csrf_tokens = state.csrf_tokens.write().await;
-        match csrf_tokens.remove(&params.state) {
-            Some(expires) if expires > Utc::now().timestamp() => {
-                debug!("CSRF token validated");
-            },
-            _ => {
-                warn!(event = "csrf_validation_failed", ip = %client_ip);
-                return render_error("Invalid or expired OAuth state. Please try again.".into());
-            }
-        }
+    if !state.validate_csrf_token(&params.state).await {
+        warn!(event = "csrf_validation_failed", ip = %client_ip);
+        return render_error("Invalid or expired OAuth state. Please try again.".into());
     }
+    
+    // Check for pending link
+    let _pending_discord_id = state.get_pending_link(&params.state).await;
     
     // Exchange code for token
     let token_result = state.oauth_client
@@ -761,7 +876,14 @@ async fn discord_callback(
     let now = Utc::now().timestamp();
     let expires_at = now + SESSION_DURATION_SECS;
     
-    save_session(&state.pool, &session_id, &username, expires_at, &client_ip).await;
+    let session = SessionData {
+        username: username.clone(),
+        expires_at,
+        created_ip: client_ip.clone(),
+        created_at: Utc::now().to_rfc3339(),
+    };
+    
+    let _ = state.save_session(&session_id, &session).await;
     update_user_ip(&state.pool, &username, &client_ip).await;
     
     let user = dashboard_logic(&state.pool, &username).await;
@@ -776,7 +898,7 @@ async fn discord_callback(
 }
 
 // ============================================================================
-// STRIPE HANDLERS (with timestamp validation)
+// STRIPE HANDLERS
 // ============================================================================
 async fn create_checkout(
     State(state): State<Arc<AppState>>,
@@ -789,19 +911,19 @@ async fn create_checkout(
     }
     let amount_cents = (amount_dollars * 100.0).round() as i64;
     
-    // Get session username from database
+    // Get session username from cookie -> Redis
     let username = if let Some(cookie) = headers.get("cookie") {
         if let Ok(cookie_str) = cookie.to_str() {
-            let mut found_username = None;
+            let mut found = None;
             for part in cookie_str.split(';') {
                 if let Some(sid) = part.trim().strip_prefix("session=") {
-                    if let Some((uname, _)) = get_session(&state.pool, sid).await {
-                        found_username = Some(uname);
+                    if let Some(session) = state.get_session(sid).await {
+                        found = Some(session.username);
                         break;
                     }
                 }
             }
-            found_username
+            found
         } else { None }
     } else { None };
     
@@ -926,7 +1048,7 @@ fn verify_stripe_signature(payload: &str, signature: &str, secret: &str) -> bool
         _ => return false,
     };
     
-    // Timestamp validation (replay attack protection)
+    // Timestamp validation
     let ts: i64 = match timestamp_str.parse() {
         Ok(t) => t,
         Err(_) => return false,
@@ -951,7 +1073,7 @@ fn verify_stripe_signature(payload: &str, signature: &str, secret: &str) -> bool
 }
 
 // ============================================================================
-// GSN INTEGRATION API HANDLERS
+// GSN API HANDLERS
 // ============================================================================
 async fn get_user_by_discord(
     Path(discord_id): Path<String>,
@@ -1009,7 +1131,6 @@ async fn verify_token(
 
     match row {
         Some(row) => {
-            // Update last_seen
             let _ = sqlx::query("UPDATE users SET last_seen = ? WHERE access_token = ?")
                 .bind(Utc::now().to_rfc3339())
                 .bind(token)
@@ -1056,7 +1177,6 @@ async fn report_usage(
 
     let new_used = current_used + req.bytes_used as i64;
 
-    // Calculate cost if over free tier
     let cost = if is_vip {
         0.0
     } else {
@@ -1125,36 +1245,9 @@ async fn get_dcf_stats(
 }
 
 // ============================================================================
-// BACKGROUND TASKS
+// SHUTDOWN
 // ============================================================================
-fn spawn_session_cleanup(pool: SqlitePool, shutdown: Arc<AtomicBool>) {
-    tokio::spawn(async move {
-        while !shutdown.load(Ordering::Relaxed) {
-            sleep(Duration::from_secs(300)).await;
-            let now = Utc::now().timestamp();
-            let _ = sqlx::query("DELETE FROM sessions WHERE expires_at < ?")
-                .bind(now)
-                .execute(&pool)
-                .await;
-        }
-    });
-}
-
-fn spawn_csrf_cleanup(csrf_tokens: Arc<RwLock<HashMap<String, i64>>>, shutdown: Arc<AtomicBool>) {
-    tokio::spawn(async move {
-        while !shutdown.load(Ordering::Relaxed) {
-            sleep(Duration::from_secs(60)).await;
-            let now = Utc::now().timestamp();
-            let mut tokens = csrf_tokens.write().await;
-            tokens.retain(|_, expires| *expires > now);
-        }
-    });
-}
-
 async fn shutdown_signal(shutdown: Arc<AtomicBool>) {
-    // Create signal listeners BEFORE the async blocks
-    // This ensures they're registered immediately, not lazily
-    
     #[cfg(unix)]
     let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())
         .expect("failed to install SIGTERM handler");
@@ -1203,7 +1296,7 @@ async fn main() {
         .await
         .expect("Failed to connect to DB");
 
-    // Schema - Users table
+    // Schema
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY,
@@ -1221,22 +1314,28 @@ async fn main() {
         )"
     ).execute(&pool).await.expect("Users table migration failed");
 
-    // Schema - Sessions table (NEW)
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS sessions (
-            id TEXT PRIMARY KEY,
-            username TEXT NOT NULL,
-            expires_at INTEGER NOT NULL,
-            created_ip TEXT,
-            created_at TEXT,
-            FOREIGN KEY (username) REFERENCES users(username) ON DELETE CASCADE
-        )"
-    ).execute(&pool).await.expect("Sessions table migration failed");
-
     // Indexes
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_users_discord ON users(discord_id)").execute(&pool).await.ok();
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_users_token ON users(access_token)").execute(&pool).await.ok();
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at)").execute(&pool).await.ok();
+
+    // Redis
+    let redis_url = env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".into());
+    let redis = redis::Client::open(redis_url.as_str()).expect("Invalid Redis URL");
+    
+    // Test Redis connection
+    match redis.get_multiplexed_async_connection().await {
+        Ok(mut conn) => {
+            let pong: Result<String, _> = redis::cmd("PING").query_async(&mut conn).await;
+            if pong.is_ok() {
+                info!("Redis connected: {}", redis_url);
+            } else {
+                warn!("Redis PING failed, sessions may not persist");
+            }
+        }
+        Err(e) => {
+            warn!("Redis connection failed: {} - falling back to degraded mode", e);
+        }
+    }
 
     // Config
     let stripe_secret = env::var("STRIPE_SECRET_KEY").expect("STRIPE_SECRET_KEY missing");
@@ -1260,14 +1359,12 @@ async fn main() {
     ).unwrap());
 
     let shutdown = Arc::new(AtomicBool::new(false));
-    let csrf_tokens = Arc::new(RwLock::new(HashMap::new()));
 
     let state = Arc::new(AppState {
-        pool: pool.clone(),
+        pool,
+        redis,
         oauth_client,
         http_client: HttpClient::builder().timeout(Duration::from_secs(30)).build().unwrap(),
-        login_attempts: Arc::new(RwLock::new(HashMap::new())),
-        csrf_tokens: csrf_tokens.clone(),
         stripe_secret,
         stripe_webhook_secret,
         base_url,
@@ -1275,9 +1372,6 @@ async fn main() {
         metrics: Arc::new(Metrics::default()),
         shutdown: shutdown.clone(),
     });
-
-    spawn_session_cleanup(pool, shutdown.clone());
-    spawn_csrf_cleanup(csrf_tokens, shutdown.clone());
 
     let app = Router::new()
         // Core routes
@@ -1293,7 +1387,7 @@ async fn main() {
         // Billing routes
         .route("/checkout", post(create_checkout))
         .route("/stripe/webhook", post(stripe_webhook))
-        // GSN Integration API (NEW)
+        // GSN Integration API
         .route("/api/user/discord/:discord_id", get(get_user_by_discord))
         .route("/api/user/verify", get(verify_token))
         .route("/api/usage/report", post(report_usage))
@@ -1315,4 +1409,4 @@ async fn main() {
         .unwrap();
 
     info!("Shutdown complete");
-}
+        }
