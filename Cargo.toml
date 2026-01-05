@@ -1,6 +1,6 @@
 [package]
 name = "dcf-id"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 authors = ["DeMoD LLC"]
 description = "DeMoD Communications Framework - Identity & Billing Service"
@@ -9,11 +9,14 @@ license = "Proprietary"
 [dependencies]
 # Web framework
 axum = "0.7"
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["full", "signal"] }
 tower-http = { version = "0.5", features = ["trace", "timeout", "compression-gzip"] }
 
 # Database
 sqlx = { version = "0.7", features = ["runtime-tokio", "sqlite"] }
+
+# Redis
+redis = { version = "0.25", features = ["tokio-comp", "connection-manager"] }
 
 # Templating
 askama = "0.12"
@@ -45,6 +48,9 @@ tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 
 # Config
 dotenvy = "0.15"
+
+# Async utils
+futures = "0.3"
 
 [profile.release]
 opt-level = 3
