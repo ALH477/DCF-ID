@@ -253,6 +253,25 @@ async fn webhook_credits_once_checks_every_v1_and_refuses_the_rest() {
 }
 
 #[tokio::test]
+async fn webhook_without_a_checkout_session_id_credits_nothing_and_is_visible_as_a_400() {
+    let s = serve().await;
+    seed(&s.state.pool, "payer", TOK, 0, 0.0, false).await;
+    let now = chrono::Utc::now().timestamp();
+    for (i, session) in [None, Some(""), Some("not_a_session")].into_iter().enumerate() {
+        let mut v: serde_json::Value = serde_json::from_str(&webhook_body(&format!("evt_ns{i}"), TOK, 500)).unwrap();
+        match session {
+            None => {
+                v["data"]["object"].as_object_mut().unwrap().remove("id");
+            }
+            Some(sid) => v["data"]["object"]["id"] = serde_json::Value::String(sid.into()),
+        }
+        let body = v.to_string();
+        assert_eq!(deliver(&s, &body, &format!("t={now},v1={}", sig(&body, now, WH))).await, 400, "session {session:?}");
+    }
+    assert_eq!(balance(&s.state.pool, TOK).await, 0.0);
+}
+
+#[tokio::test]
 async fn webhook_database_failure_is_a_500_so_stripe_retries() {
     let s = serve().await;
     seed(&s.state.pool, "payer", TOK, 0, 0.0, false).await;

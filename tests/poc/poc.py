@@ -270,14 +270,15 @@ def login(svc, name, pw, headers=None):
 
 
 def stripe_body(evt_id, token, cents=500, dollars="5.00", status="paid", session=None, currency="usd", user_id=None):
+    """session=None: a normal cs_ id derived from the event id; session=False: no session id at all"""
     md = {"access_token": token, "amount_dollars": dollars}
     if user_id is not None:
         md["user_id"] = str(user_id)
-    return json.dumps({
-        "id": evt_id, "object": "event", "type": "checkout.session.completed",
-        "data": {"object": {"id": session or ("cs_" + evt_id), "object": "checkout.session", "amount_total": cents,
-                            "currency": currency, "payment_status": status, "metadata": md}},
-    })
+    obj = {"object": "checkout.session", "amount_total": cents, "currency": currency,
+           "payment_status": status, "metadata": md}
+    if session is not False:
+        obj["id"] = ("cs_" + evt_id) if session is None else session
+    return json.dumps({"id": evt_id, "object": "event", "type": "checkout.session.completed", "data": {"object": obj}})
 
 
 def stripe_header(body, ts=None, secret=WH_SECRET, order=("good",), bad=None):
@@ -544,6 +545,21 @@ def check_I6(binary, redis):
         st, _, _ = webhook(s, body, stripe_header(body, order=("good", "bad")))
         report("I6d", "a header with the valid v1 first and a rotated-out v1 second is refused",
                "VULN" if (st != 200 or s.balance(tok4) < 5.0) else "ok", "HTTP %s balance=%.2f" % (st, s.balance(tok4)))
+        # NEW-2: one payment delivered as two different events, neither carrying a checkout session id
+        tok7 = s.seed("payer7", bal=0.0)
+        b1 = stripe_body("evt_nosess_1", tok7, session=False)
+        b2 = stripe_body("evt_nosess_2", tok7, session=False)
+        st1, _, _ = webhook(s, b1, stripe_header(b1))
+        st2, _, _ = webhook(s, b2, stripe_header(b2))
+        report("I6e", "two events without a checkout session id for one payment are credited twice",
+               "VULN" if s.balance(tok7) > 5.0 + 1e-9 else "ok", "HTTP %s/%s balance=%.2f" % (st1, st2, s.balance(tok7)))
+        bad7 = s.seed("payer8", bal=0.0)
+        refused = []
+        for k, sid in enumerate(["", "evt_looks_like_an_event", "cs_has space", "x" * 300, "cs_" + "y" * 300]):
+            b = stripe_body("evt_badsess_%d" % k, bad7, session=sid)
+            webhook(s, b, stripe_header(b))
+        report("I6f", "implausible checkout session ids (empty, wrong prefix, spaces, over-long) are credited",
+               "VULN" if s.balance(bad7) > 0 else "ok", "balance=%.2f" % s.balance(bad7))
         # e: a bad signature must still be refused
         tok5 = s.seed("payer5", bal=0.0)
         body = stripe_body("evt_bad_1", tok5)

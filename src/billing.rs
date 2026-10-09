@@ -587,6 +587,32 @@ mod tests {
         assert_eq!(balance(&db.pool, TOK).await, 0.0);
     }
 
+    #[tokio::test]
+    async fn an_event_without_a_plausible_checkout_session_id_is_never_credited() {
+        // Without a session id the only dedup key is the event id, and two different event ids for one
+        // payment would both credit. Real checkout.session.completed events always carry the session id.
+        let db = temp_db().await;
+        seed(&db.pool, "payer", TOK, 0, 0.0, false).await;
+        let too_long = format!("cs_{}", "y".repeat(300));
+        let cases: Vec<Option<&str>> = vec![None, Some(""), Some("evt_looks_like_an_event"), Some("cs_has space"), Some("cs_semi;colon"), Some(&too_long), Some("cs_")];
+        for (i, session) in cases.iter().enumerate() {
+            for twin in 0..2 {
+                let mut ev = event(&format!("evt_nosess_{i}_{twin}"), "ignored", TOK, 500, "paid");
+                ev.data.object.id = session.map(|s| s.to_string());
+                let out = credit_checkout(&db.pool, &ev).await.unwrap();
+                assert!(!matches!(out, CreditOutcome::Credited { .. }), "session id {session:?} was credited ({out:?})");
+            }
+        }
+        assert_eq!(balance(&db.pool, TOK).await, 0.0);
+        // with a real-shaped id: once, however many event ids carry it
+        for k in 0..3 {
+            let ev = event(&format!("evt_real_{k}"), "cs_test_a1B2c3", TOK, 500, "paid");
+            let out = credit_checkout(&db.pool, &ev).await.unwrap();
+            assert_eq!(matches!(out, CreditOutcome::Credited { .. }), k == 0, "delivery {k}: {out:?}");
+        }
+        assert_eq!(balance(&db.pool, TOK).await, 5.0);
+    }
+
     #[test]
     fn real_stripe_payload_shape_deserialises() {
         let body = r#"{"id":"evt_1NG8Du2eZvKYlo2CUI79vXWy","object":"event","api_version":"2022-11-15","created":1686089970,
