@@ -32,6 +32,9 @@ pub(crate) fn test_state(pool: sqlx::SqlitePool, auth: ApiAuth, base_url: &str) 
         api_auth: auth,
         trusted_proxies: TrustedProxies::none(),
         local_limiter: LocalLimiter::new(1000),
+        hash_permits: Arc::new(tokio::sync::Semaphore::new(4)),
+        hash_wait: std::time::Duration::from_secs(60), // tests that want "busy" set their own
+
         metrics: Arc::new(Metrics::default()),
         shutdown: Arc::new(AtomicBool::new(false)),
     })

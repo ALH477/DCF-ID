@@ -65,6 +65,12 @@ futures = "0.3"
 # compiles the vendored Exsecutor gate (gate/*.c); see gate/PROVENANCE.md
 cc = "1"
 
+# Argon2 at opt-level 0 is slow enough to make the concurrency tests slow and timing-sensitive.
+[profile.dev.package.argon2]
+opt-level = 3
+[profile.dev.package.blake2]
+opt-level = 3
+
 [profile.release]
 opt-level = 3
 lto = true

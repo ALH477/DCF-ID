@@ -15,16 +15,12 @@
 // (src/lib.rs and its modules) so that `cargo test --lib` runs without it.
 // ============================================================================
 
-use argon2::{
-    password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
-    Argon2,
-};
 use askama::Template;
 use axum::{
     body::Body,
     extract::{ConnectInfo, Form, Query, State},
     http::{
-        header::{LOCATION, SET_COOKIE},
+        header::{LOCATION, RETRY_AFTER, SET_COOKIE},
         HeaderMap, HeaderValue, StatusCode,
     },
     response::{Html, IntoResponse, Redirect, Response},
@@ -33,12 +29,12 @@ use axum::{
 };
 use chrono::Utc;
 use dcf_id::{
-    api, billing, db, gate,
+    api, auth, billing, db, gate,
     limiter::LocalLimiter,
     security::{self, ApiAuth, TrustedProxies},
     state::{
-        AppState, Metrics, SessionData, LOCAL_LIMITER_KEYS, LOCKOUT_DURATION_SECS, SESSION_DURATION_SECS,
-        CSRF_TOKEN_DURATION_SECS, user_throttle_key,
+        AppState, Metrics, SessionData, CSRF_TOKEN_DURATION_SECS, HASH_QUEUE_WAIT, LOCAL_LIMITER_KEYS, LOCKOUT_DURATION_SECS,
+        SESSION_DURATION_SECS,
     },
     VERSION,
 };
@@ -59,7 +55,7 @@ use std::{
     },
     time::Duration,
 };
-use tokio::signal;
+use tokio::{signal, sync::Semaphore};
 use tracing::{error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -176,6 +172,14 @@ fn render_index(user: Option<UserDisplay>) -> String {
     IndexTemplate { user, error: None, version: VERSION }.render().unwrap_or_else(|_| "Error".into())
 }
 
+/// Every Argon2 slot is taken and none came free in time: 503, try again.
+fn busy_response() -> Response {
+    let mut resp = render_error("The server is busy. Please try again in a moment.".into());
+    *resp.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
+    resp.headers_mut().insert(RETRY_AFTER, HeaderValue::from_static("2"));
+    resp
+}
+
 /// Log the user in: a new session in Redis, the dashboard, and the session cookie.
 async fn start_session(state: &AppState, username: &str, client_ip: &str) -> Response {
     let session_id = generate_token(64);
@@ -243,10 +247,11 @@ async fn register(
         return render_error("Too many registration attempts from this address. Try again later.".into());
     }
 
-    let salt = SaltString::generate(&mut OsRng);
-    let password_hash = match Argon2::default().hash_password(payload.password.as_bytes(), &salt) {
-        Ok(h) => h.to_string(),
-        Err(_) => return render_error("Registration failed".into()),
+    // Argon2 on the blocking pool, behind the same bounded permits as login; "busy" is a 503, not a queue.
+    let password_hash = match auth::hash_password(&state, &payload.password).await {
+        Ok(h) => h,
+        Err(auth::HashError::Busy) => return busy_response(),
+        Err(auth::HashError::Failed) => return render_error("Registration failed".into()),
     };
 
     let token = generate_token(32);
@@ -274,45 +279,25 @@ async fn login(
     state.metrics.requests_total.fetch_add(1, Ordering::Relaxed);
     let client_ip = state.client_ip(&headers, addr);
     let ip = client_ip.to_string();
-    let user_key = user_throttle_key(&payload.username);
 
-    // Locked out? (per address and per username; Redis, else the in-process limiter)
-    if let Some(ttl) = state.login_lockout(&ip, &user_key).await {
-        return render_error(format!("Too many attempts. Try again in {} seconds.", ttl.min(LOCKOUT_DURATION_SECS)));
-    }
-
-    // Bound the work before any hashing. A login may name a legacy, non-ASCII username (it is only a bound
-    // SQL parameter), but not an absurd one, and no password of more than 256 bytes was ever accepted by a
-    // check: Argon2 is not made faster by a short password, but the form is not a place to park megabytes.
-    let too_big = payload.username.len() > security::MAX_LOGIN_USERNAME_BYTES || payload.password.len() > security::MAX_PASSWORD_LENGTH;
-
-    let password_hash = if too_big { None } else { db::get_password_hash(&state.pool, &payload.username).await };
-
-    let login_success = if too_big {
-        false
-    } else if let Some(hash) = password_hash {
-        if let Ok(parsed) = PasswordHash::new(&hash) {
-            Argon2::default().verify_password(payload.password.as_bytes(), &parsed).is_ok()
-        } else {
-            false
+    // The attempt takes its slot (address, username) before any hashing, and Argon2 runs on the blocking
+    // pool behind a bounded number of permits: see src/auth.rs.
+    match auth::attempt_login(&state, &ip, &payload.username, &payload.password).await {
+        auth::LoginOutcome::Success => {
+            info!(event = "login_success", username = %payload.username);
+            state.metrics.logins_success.fetch_add(1, Ordering::Relaxed);
+            let stored_ip = security::ip_for_storage(client_ip);
+            db::update_user_ip(&state.pool, &payload.username, stored_ip.as_deref()).await;
+            start_session(&state, &payload.username, &ip).await
         }
-    } else {
-        // Timing attack mitigation (no such user, or a user without a password)
-        let _ = Argon2::default().hash_password(payload.password.as_bytes(), &SaltString::generate(&mut OsRng));
-        false
-    };
-
-    if login_success {
-        state.clear_login_failures(&ip, &user_key).await;
-        info!(event = "login_success", username = %payload.username);
-        state.metrics.logins_success.fetch_add(1, Ordering::Relaxed);
-        let stored_ip = security::ip_for_storage(client_ip);
-        db::update_user_ip(&state.pool, &payload.username, stored_ip.as_deref()).await;
-        start_session(&state, &payload.username, &ip).await
-    } else {
-        state.record_login_failure(&ip, &user_key).await;
-        state.metrics.logins_failed.fetch_add(1, Ordering::Relaxed);
-        render_error("Invalid credentials".into())
+        auth::LoginOutcome::BadCredentials => {
+            state.metrics.logins_failed.fetch_add(1, Ordering::Relaxed);
+            render_error("Invalid credentials".into())
+        }
+        auth::LoginOutcome::Locked(ttl) => {
+            render_error(format!("Too many attempts. Try again in {} seconds.", ttl.min(LOCKOUT_DURATION_SECS)))
+        }
+        auth::LoginOutcome::Busy => busy_response(),
     }
 }
 
@@ -605,6 +590,10 @@ async fn main() {
 
     let shutdown = Arc::new(AtomicBool::new(false));
 
+    // One Argon2 at a time per CPU (each holds ~19 MiB and a core); more wait, briefly, then get a 503.
+    let hash_slots = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2).max(1);
+    info!(argon2_slots = hash_slots, "password hashing is bounded to one operation per CPU");
+
     let state = Arc::new(AppState {
         pool,
         redis,
@@ -616,6 +605,8 @@ async fn main() {
         api_auth,
         trusted_proxies,
         local_limiter: LocalLimiter::new(LOCAL_LIMITER_KEYS),
+        hash_permits: Arc::new(Semaphore::new(hash_slots)),
+        hash_wait: HASH_QUEUE_WAIT,
         metrics: Arc::new(Metrics::default()),
         shutdown: shutdown.clone(),
     });

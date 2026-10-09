@@ -104,12 +104,13 @@ def check_wrong_burst(redis, mode):
     for N in (30, 100):
         s = fresh(redis)
         try:
+            before = metric(s, "argon2_runs")       # includes the hash of the registration above
             counts, wall, health = burst(s, N, lambda i: {"username": "victim1", "password": "wrong-guess-%d" % i})
             ev = counts.get("evaluated", 0)
-            runs = metric(s, "argon2_runs")
-            detail = "%s; max login wall %.2fs; /health during the burst %.2fs (HTTP %s); server's own argon2_runs=%s" % (
-                counts, wall, health[0], health[1], runs if runs is not None else "n/a (not exposed)")
-            # the user was registered through the service, which ran 1 hash itself
+            after = metric(s, "argon2_runs")
+            runs = "n/a (not exposed)" if after is None or before is None else after - before
+            detail = "%s; max login wall %.2fs; /health during the burst %.2fs (HTTP %s); server's own argon2_runs during the burst=%s" % (
+                counts, wall, health[0], health[1], runs)
             report("A%d" % N, "[%s] %d concurrent WRONG logins against one real user: at most %d may reach Argon2" % (mode, N, LIMIT),
                    "VULN" if ev > LIMIT else "ok", "%d of %d evaluated; %s" % (ev, N, detail))
         finally:

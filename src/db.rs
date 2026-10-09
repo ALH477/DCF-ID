@@ -42,7 +42,10 @@ pub async fn init(pool: &SqlitePool) -> Result<SchemaReport, sqlx::Error> {
 
     // Stripe event ids already credited: a retry or a replay inside the signature
     // tolerance must not credit twice. session_id is UNIQUE as well, so two different
-    // events for one checkout session still credit once.
+    // events for one checkout session still credit once. (UNIQUE allows many NULLs, so
+    // billing::credit_checkout refuses to credit an event that has no checkout session id;
+    // the column is not declared NOT NULL because INSERT OR IGNORE would swallow that
+    // violation as "already processed".)
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS stripe_events (
             id TEXT PRIMARY KEY,

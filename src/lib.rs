@@ -7,6 +7,7 @@
 // ============================================================================
 
 pub mod api;
+pub mod auth;
 pub mod billing;
 pub mod db;
 pub mod gate;

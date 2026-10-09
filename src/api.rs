@@ -39,6 +39,8 @@ pub struct MetricsResponse {
     pub payments_total: u64,
     pub api_calls: u64,
     pub redis_errors: u64,
+    pub argon2_runs: u64,
+    pub argon2_busy: u64,
 }
 
 #[derive(Serialize)]
@@ -147,6 +149,8 @@ pub async fn metrics(State(state): State<Arc<AppState>>, headers: HeaderMap) -> 
         payments_total: state.metrics.payments_total.load(Ordering::Relaxed),
         api_calls: state.metrics.api_calls.load(Ordering::Relaxed),
         redis_errors: state.metrics.redis_errors.load(Ordering::Relaxed),
+        argon2_runs: state.metrics.argon2_runs.load(Ordering::Relaxed),
+        argon2_busy: state.metrics.argon2_busy.load(Ordering::Relaxed),
     }))
 }
 
@@ -183,6 +187,10 @@ pub async fn stripe_webhook(State(state): State<Arc<AppState>>, headers: HeaderM
         Ok(CreditOutcome::Ignored(why)) => {
             warn!(event = "stripe_event_ignored", why);
             StatusCode::OK
+        }
+        Ok(CreditOutcome::Rejected(why)) => {
+            error!(event = "stripe_event_rejected", why);
+            StatusCode::BAD_REQUEST
         }
         Err(e) => {
             // Not recorded, not credited: let Stripe retry.

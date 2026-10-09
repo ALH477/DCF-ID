@@ -13,21 +13,27 @@ use sha2::{Digest, Sha256};
 use sqlx::sqlite::SqlitePool;
 use std::{
     net::{IpAddr, SocketAddr},
+    sync::OnceLock,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     },
     time::Duration,
 };
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::{error, warn};
 
 pub const SESSION_DURATION_SECS: i64 = 86400 * 7; // 7 days
+/// Password attempts one client ADDRESS may make per window. An attempt takes its slot before any hashing
+/// is done, so a concurrent burst cannot get more than this many verifications through.
 pub const MAX_LOGIN_ATTEMPTS: u64 = 5;
 pub const LOCKOUT_DURATION_SECS: i64 = 900; // 15 minutes
-/// Failures against one USERNAME, from any addresses, before that username is locked for the
-/// same 15 minutes. Generous on purpose: it exists to stop a distributed guesser, and locking a
-/// name is itself a nuisance an attacker can cause.
-pub const MAX_USER_LOGIN_FAILURES: u64 = 20;
+/// Password attempts naming one USERNAME, from all addresses together, per window. Generous on purpose: it
+/// exists to stop a guesser spread over many addresses. It is also a lever against the owner: anyone who can
+/// send this many requests naming a user can keep that user out of password login for a window (see the README).
+pub const MAX_USER_LOGIN_ATTEMPTS: u64 = 20;
+/// How long a request waits for an Argon2 slot before it is turned away with 503.
+pub const HASH_QUEUE_WAIT: Duration = Duration::from_secs(2);
 pub const CSRF_TOKEN_DURATION_SECS: i64 = 600; // 10 minutes
 pub const MAX_REGISTRATIONS_PER_HOUR: u64 = 10;
 pub const REGISTER_WINDOW_SECS: i64 = 3600;
@@ -37,7 +43,6 @@ const REDIS_CONNECT_TIMEOUT: Duration = Duration::from_millis(1500);
 
 const REDIS_SESSION_PREFIX: &str = "session:";
 const REDIS_RATELIMIT_PREFIX: &str = "ratelimit:";
-const REDIS_LOCKOUT_PREFIX: &str = "lockout:";
 const REDIS_CSRF_PREFIX: &str = "csrf:";
 
 pub struct AppState {
@@ -51,6 +56,10 @@ pub struct AppState {
     pub api_auth: ApiAuth,
     pub trusted_proxies: TrustedProxies,
     pub local_limiter: LocalLimiter,
+    /// Argon2 hashing and verification run on the blocking pool, at most this many at once.
+    pub hash_permits: Arc<Semaphore>,
+    /// How long a request may wait for one of them.
+    pub hash_wait: Duration,
     pub metrics: Arc<Metrics>,
     pub shutdown: Arc<AtomicBool>,
 }
@@ -65,6 +74,10 @@ pub struct Metrics {
     pub payments_amount_cents: AtomicU64,
     pub api_calls: AtomicU64,
     pub redis_errors: AtomicU64,
+    /// Argon2 operations actually run (verifications, dummy hashes for unknown users, registrations).
+    pub argon2_runs: AtomicU64,
+    /// Requests turned away with 503 because no Argon2 slot came free in time.
+    pub argon2_busy: AtomicU64,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -73,6 +86,64 @@ pub struct SessionData {
     pub expires_at: i64,
     pub created_ip: String,
     pub created_at: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Backend {
+    Redis,
+    Local,
+}
+
+/// The attempt slots one admitted login holds (and in which store each lives).
+#[derive(Debug)]
+pub struct LoginSlots {
+    ip: String,
+    ip_backend: Backend,
+    user_key: String,
+    user_backend: Backend,
+}
+
+#[derive(Debug)]
+pub enum SlotResult {
+    Admitted(LoginSlots),
+    /// Turned away; seconds until the window ends.
+    Locked(i64),
+}
+
+// KEYS[1] counter; ARGV[1] max, ARGV[2] window seconds. Returns {admitted, count, ttl}.
+// The increment, the window (restarted at the max-th attempt, so a lockout lasts a full window from the last
+// permitted guess), the turn-away (an attempt over max is un-counted) and a repair for a counter that lost its
+// expiry are one atomic step.
+const TAKE_LUA: &str = r#"
+local n = redis.call('INCR', KEYS[1])
+local max = tonumber(ARGV[1])
+local window = tonumber(ARGV[2])
+if n == 1 or n == max then redis.call('EXPIRE', KEYS[1], window) end
+local admitted = 1
+if n > max then
+  redis.call('DECR', KEYS[1])
+  n = n - 1
+  admitted = 0
+end
+local ttl = redis.call('TTL', KEYS[1])
+if ttl < 0 then redis.call('EXPIRE', KEYS[1], window); ttl = window end
+return {admitted, n, ttl}
+"#;
+
+const REFUND_LUA: &str = r#"
+local n = redis.call('DECR', KEYS[1])
+if n <= 0 then redis.call('DEL', KEYS[1]) end
+return n
+"#;
+
+fn take_script() -> &'static redis::Script {
+    static S: OnceLock<redis::Script> = OnceLock::new();
+    S.get_or_init(|| redis::Script::new(TAKE_LUA))
+}
+
+fn refund_script() -> &'static redis::Script {
+    static S: OnceLock<redis::Script> = OnceLock::new();
+    S.get_or_init(|| redis::Script::new(REFUND_LUA))
 }
 
 /// The throttle key for a username: its lower-cased SHA-256, so what reaches Redis is neither
@@ -150,100 +221,110 @@ impl AppState {
         }
     }
 
-    async fn redis_lock_ttl(conn: &mut redis::aio::MultiplexedConnection, key: &str) -> Result<Option<i64>, redis::RedisError> {
-        let ttl: i64 = conn.ttl(format!("{}{}", REDIS_LOCKOUT_PREFIX, key)).await?;
-        // -2: no key; -1: key without expiry (treat as locked for the full window)
-        Ok(match ttl {
-            -2 => None,
-            -1 => Some(LOCKOUT_DURATION_SECS),
-            t => Some(t.max(1)),
-        })
-    }
-
-    async fn redis_fail(
-        conn: &mut redis::aio::MultiplexedConnection,
+    /// Take one slot under `key`, in Redis or, if Redis fails, in the in-process limiter. One script, so the
+    /// increment, the window and the turn-away are a single step: concurrent callers get distinct counts.
+    async fn take_one(
+        &self,
+        conn: &mut Option<redis::aio::MultiplexedConnection>,
         key: &str,
         max: u64,
         window_secs: i64,
-    ) -> Result<bool, redis::RedisError> {
-        let ckey = format!("{}{}", REDIS_RATELIMIT_PREFIX, key);
-        let count: i64 = conn.incr(&ckey, 1).await?;
-        if count == 1 {
-            let _: Result<(), _> = conn.expire(&ckey, window_secs).await;
-        }
-        let locked = count as u64 >= max;
-        if locked {
-            let _: Result<(), _> =
-                conn.set_ex::<_, _, ()>(format!("{}{}", REDIS_LOCKOUT_PREFIX, key), "1", window_secs as u64).await;
-        }
-        Ok(locked)
-    }
-
-    /// Seconds left if this address, or this username, is locked out of login. Redis is asked first; if it
-    /// cannot be reached the in-process limiter answers instead -- a lockout that exists, not one that fails open.
-    pub async fn login_lockout(&self, ip: &str, user_key: &str) -> Option<i64> {
-        let mut conn = self.throttle_conn().await;
-        let mut worst: Option<i64> = None;
-        for key in [ip, user_key] {
-            let ttl = match conn.as_mut() {
-                Some(c) => match Self::redis_lock_ttl(c, key).await {
-                    Ok(t) => t,
-                    Err(e) => {
-                        self.redis_failed("TTL", &e);
-                        conn = None;
-                        self.local_limiter.locked_ttl(&format!("lock:{}", key))
-                    }
-                },
-                None => self.local_limiter.locked_ttl(&format!("lock:{}", key)),
-            };
-            worst = match (worst, ttl) {
-                (Some(a), Some(b)) => Some(a.max(b)),
-                (a, b) => a.or(b),
-            };
-        }
-        worst
-    }
-
-    pub async fn record_login_failure(&self, ip: &str, user_key: &str) {
-        let mut conn = self.throttle_conn().await;
-        for (key, max) in [(ip, MAX_LOGIN_ATTEMPTS), (user_key, MAX_USER_LOGIN_FAILURES)] {
-            let via_redis = match conn.as_mut() {
-                Some(c) => match Self::redis_fail(c, key, max, LOCKOUT_DURATION_SECS).await {
-                    Ok(locked) => {
-                        if locked {
-                            warn!(event = "lockout", key = %key, "locked out after {} failures", max);
-                        }
-                        true
-                    }
-                    Err(e) => {
-                        self.redis_failed("INCR", &e);
-                        conn = None;
-                        false
-                    }
-                },
-                None => false,
-            };
-            if !via_redis {
-                self.local_limiter.fail(&format!("lock:{}", key), max, Duration::from_secs(LOCKOUT_DURATION_SECS as u64));
+    ) -> (Backend, bool, i64) {
+        if let Some(c) = conn.as_mut() {
+            let r: Result<(i64, i64, i64), _> = take_script()
+                .key(format!("{}{}", REDIS_RATELIMIT_PREFIX, key))
+                .arg(max)
+                .arg(window_secs)
+                .invoke_async(c)
+                .await;
+            match r {
+                Ok((admitted, _count, ttl)) => return (Backend::Redis, admitted == 1, ttl.max(1)),
+                Err(e) => {
+                    self.redis_failed("EVAL", &e);
+                    *conn = None;
+                }
             }
         }
+        let (admitted, ttl) = self.local_limiter.take(&format!("lock:{}", key), max, Duration::from_secs(window_secs as u64));
+        (Backend::Local, admitted, ttl)
     }
 
-    pub async fn clear_login_failures(&self, ip: &str, user_key: &str) {
-        let mut conn = self.throttle_conn().await;
-        for key in [ip, user_key] {
-            let done = match conn.as_mut() {
-                Some(c) => {
-                    let r: Result<(), _> = c.del(format!("{}{}", REDIS_RATELIMIT_PREFIX, key)).await;
-                    if let Err(e) = &r {
-                        self.redis_failed("DEL", e);
-                    }
-                    r.is_ok()
+    async fn refund_one(&self, conn: &mut Option<redis::aio::MultiplexedConnection>, key: &str, backend: Backend) {
+        match (backend, conn.as_mut()) {
+            (Backend::Redis, Some(c)) => {
+                let r: Result<i64, _> = refund_script().key(format!("{}{}", REDIS_RATELIMIT_PREFIX, key)).invoke_async(c).await;
+                if let Err(e) = r {
+                    self.redis_failed("EVAL", &e);
+                    *conn = None;
                 }
-                None => false,
-            };
-            if !done {
-                self.local_limiter.clear(&format!("lock:{}", key));
+            }
+            (Backend::Redis, None) => {} // Redis went away after the slot was taken: its TTL will release it
+            (Backend::Local, _) => self.local_limiter.refund(&format!("lock:{}", key)),
+        }
+    }
+
+    async fn reset_one(&self, conn: &mut Option<redis::aio::MultiplexedConnection>, key: &str, backend: Backend) {
+        match (backend, conn.as_mut()) {
+            (Backend::Redis, Some(c)) => {
+                let r: Result<(), _> = c.del(format!("{}{}", REDIS_RATELIMIT_PREFIX, key)).await;
+                if let Err(e) = r {
+                    self.redis_failed("DEL", &e);
+                    *conn = None;
+                }
+            }
+            (Backend::Redis, None) => {}
+            (Backend::Local, _) => self.local_limiter.clear(&format!("lock:{}", key)),
+        }
+    }
+
+    /// Take the attempt slots for one password login, BEFORE any password is hashed or compared.
+    ///
+    /// The address's slot is taken first; if it is spent, the request is turned away without touching the
+    /// username's counter (a locked address cannot burn a victim's budget). Then the username's slot; if that
+    /// is spent, the address's slot is given back (nothing was evaluated). Both are atomic increments, so a
+    /// burst of N concurrent requests is admitted at most MAX_LOGIN_ATTEMPTS (address) and
+    /// MAX_USER_LOGIN_ATTEMPTS (username) times, however the requests interleave.
+    pub async fn take_login_slots(&self, ip: &str, user_key: &str) -> SlotResult {
+        let mut conn = self.throttle_conn().await;
+        let (ip_backend, ok, ttl) = self.take_one(&mut conn, ip, MAX_LOGIN_ATTEMPTS, LOCKOUT_DURATION_SECS).await;
+        if !ok {
+            warn!(event = "lockout", key = %ip, "address over its login attempts");
+            return SlotResult::Locked(ttl);
+        }
+        let (user_backend, ok, ttl) = self.take_one(&mut conn, user_key, MAX_USER_LOGIN_ATTEMPTS, LOCKOUT_DURATION_SECS).await;
+        if !ok {
+            warn!(event = "lockout", key = %user_key, "username over its login attempts");
+            self.refund_one(&mut conn, ip, ip_backend).await;
+            return SlotResult::Locked(ttl);
+        }
+        SlotResult::Admitted(LoginSlots { ip: ip.to_string(), ip_backend, user_key: user_key.to_string(), user_backend })
+    }
+
+    /// The password was right: the address's count and the username's count are both cleared (as they always
+    /// were). This keeps a shared address (a campus, a mobile carrier's NAT) usable: one person's typos do not
+    /// outlast another person's successful login. It also means an attacker with a valid account of their own can
+    /// interleave logins with guesses at the ADDRESS limit; the USERNAME limit is what bounds guesses at any one
+    /// victim, and it is not reachable that way (a success on another username does not clear it).
+    pub async fn login_succeeded(&self, slots: LoginSlots) {
+        let mut conn = self.throttle_conn().await;
+        self.reset_one(&mut conn, &slots.ip, slots.ip_backend).await;
+        self.reset_one(&mut conn, &slots.user_key, slots.user_backend).await;
+    }
+
+    /// Nothing was evaluated (no Argon2 slot came free): give both slots back.
+    pub async fn release_login_slots(&self, slots: LoginSlots) {
+        let mut conn = self.throttle_conn().await;
+        self.refund_one(&mut conn, &slots.ip, slots.ip_backend).await;
+        self.refund_one(&mut conn, &slots.user_key, slots.user_backend).await;
+    }
+
+    /// One of the Argon2 slots, or None (counted) if none comes free within `hash_wait`.
+    pub async fn acquire_hash_permit(&self) -> Option<OwnedSemaphorePermit> {
+        match tokio::time::timeout(self.hash_wait, self.hash_permits.clone().acquire_owned()).await {
+            Ok(Ok(p)) => Some(p),
+            _ => {
+                self.metrics.argon2_busy.fetch_add(1, Ordering::Relaxed);
+                None
             }
         }
     }
@@ -293,4 +374,4 @@ impl AppState {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

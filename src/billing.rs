@@ -191,10 +191,18 @@ pub enum CreditOutcome {
     /// Not ours or not payable (no user in the metadata, not "paid", wrong currency, amount out of
     /// bounds, no event id). Nothing changed; answer 200 so Stripe stops retrying.
     Ignored(&'static str),
+    /// Ours and paid, but malformed in a way Stripe's own events never are (no checkout session id).
+    /// Nothing changed; answer 400 so it shows up as a failed delivery instead of vanishing.
+    Rejected(&'static str),
 }
 
 fn plausible_id(s: &str) -> bool {
     !s.is_empty() && s.len() <= 255 && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+/// A Checkout Session id: `cs_test_...` / `cs_live_...`.
+fn plausible_session_id(s: &str) -> bool {
+    s.len() > 3 && s.starts_with("cs_") && plausible_id(s)
 }
 
 /// Credit a `checkout.session.completed` event, at most once.
@@ -236,7 +244,16 @@ pub async fn credit_checkout(pool: &SqlitePool, event: &StripeEvent) -> Result<C
         error!(event = "stripe_amount_out_of_bounds", event_id, cents);
         return Ok(CreditOutcome::Ignored("amount_total outside 250..=10000 cents"));
     }
-    let session_id = obj.id.as_deref().filter(|s| plausible_id(s));
+    // The checkout session id is the dedup key that makes "one payment, one credit" true when Stripe delivers
+    // the payment as more than one event; the event id alone cannot, because each delivery has its own. Real
+    // checkout.session.completed events always carry it, so an event without one is not credited at all.
+    let session_id = match obj.id.as_deref().filter(|s| plausible_session_id(s)) {
+        Some(id) => id,
+        None => {
+            error!(event = "stripe_event_without_session_id", event_id, "paid, ours, but no usable checkout session id; not credited");
+            return Ok(CreditOutcome::Rejected("no usable checkout session id"));
+        }
+    };
 
     let mut tx = pool.begin().await?;
     let fresh = sqlx::query(
@@ -600,7 +617,7 @@ mod tests {
                 let mut ev = event(&format!("evt_nosess_{i}_{twin}"), "ignored", TOK, 500, "paid");
                 ev.data.object.id = session.map(|s| s.to_string());
                 let out = credit_checkout(&db.pool, &ev).await.unwrap();
-                assert!(!matches!(out, CreditOutcome::Credited { .. }), "session id {session:?} was credited ({out:?})");
+                assert!(matches!(out, CreditOutcome::Rejected(_)), "session id {session:?}: {out:?}");
             }
         }
         assert_eq!(balance(&db.pool, TOK).await, 0.0);
