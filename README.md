@@ -301,10 +301,22 @@ Every behaviour change in this revision. Callers, operators and the game servers
   a token in the form (the template) or an `Origin` check. Not changed here.
 - `[OPEN]` The `oauth_state` and `session` cookies are not `__Host-` prefixed: a sibling subdomain you do not control can set
   them (cookie tossing). `__Host-` needs `Secure` and `Path=/`.
-- `[OPEN]` A successful login clears the *address's* count (as it always did, so a shared address stays usable). An attacker with
-  a valid account of their own can interleave logins with guesses and so exceed 5 guesses per window *per address*; guesses at any
-  one victim are still capped by that username's limit of 20 (measured: `auth::tests::a_success_clears_the_address_but_not_the_username_of_someone_else`).
-  Spraying one password across many usernames from one address is therefore not stopped by the address limit alone. Pre-existing.
+- `[OPEN]` **Credential spraying is not bounded per address.** A successful login clears the *address's* count (as it always did, so
+  a shared address stays usable). An attacker with one valid account of their own, which costs nothing because registration is
+  open, can therefore make 4 guesses (each at a different victim), log in once as themselves to clear the count, and repeat. An
+  independent reviewer measured this (`r2_spray.py`: one valid account, one address, 4 wrong guesses at distinct victims then
+  1 own login per cycle) at about **112,900 guesses per hour from a single address**; I did not re-run that script. The per-address
+  limit of 5 is bypassed entirely, and the only remaining limit is Argon2 throughput (the bounded pool and the 503 above). What
+  still holds: guesses at ONE account are capped by that username's limit of 20 per 15 minutes, and a success on the attacker's own
+  account clears only the authenticated user's counter, never a victim's (`auth::tests::a_success_clears_the_address_but_not_the_username_of_someone_else`).
+  So the exposure is spraying one guess across many accounts, not guessing at one. The original code had the same property (a
+  success deleted the address's failure counter) and had no per-username limit at all. Options for the owner, not chosen here:
+  (a) do not clear the address's count on success, and raise the per-address limit to make up for shared addresses (NATs);
+  (b) on success give back only that login's own slot; (c) add a budget of distinct usernames tried per address; (d) accept it.
+- `[OPEN]` **The attempt window is fixed, not sliding.** A counter's expiry is set at its first and at its 5th attempt only. An
+  address that uses 4 attempts, lets the key expire, and then bursts can get up to 9 Argon2 verifications (bounded by 2 x limit - 1)
+  inside one 15-minute stretch; measured 4 + 5. It is a one-time gain per expiry: the sustained rate from one address stays about
+  5 per 15 minutes (the spraying gap above is the exception).
 - `[OPEN]` No `Content-Security-Policy` (see above).
 - `[UNTESTED]` Anything that needs Discord or Stripe themselves: the token exchange, `/users/@me`, creating a real Checkout
   session. The webhook is exercised with events signed locally; the callback is exercised only as far as the state check and,
