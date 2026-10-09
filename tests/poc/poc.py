@@ -17,6 +17,16 @@ Verdicts:  [VULN]  the exploit worked against this binary (exit status 1)
 The R-checks are regression guards: they must be [ ok ] on the unmodified code
 too, so a green run is not just a service that no longer answers.
 
+The binary needs templates/index.html, which is not in the repository. These
+checks read the page for two markers, so build the binary from a scratch copy
+whose template is (any markup around)
+
+    {% if let Some(e) = error %}<p>ERROR:{{ e }}</p>{% endif %}
+    {% if let Some(u) = user %}<p>USER:{{ u.username }} TOKEN:{{ u.access_token }}</p>{% endif %}
+
+and do not commit it. Needs python3, and redis-server on PATH for the checks
+that involve Redis (without it they are [skip]).
+
 This file is part of the repository's tests; it is not used by the service.
 """
 import hashlib
@@ -426,6 +436,26 @@ def check_I4a(binary, redis):
         s.stop()
 
 
+def check_I4c(binary, redis):
+    """TRUSTED_PROXIES=127.0.0.1: this test client plays the reverse proxy. On a build without the setting
+    the first (client-controlled) entry is believed."""
+    s = Svc(binary, redis, extra_env={"TRUSTED_PROXIES": "127.0.0.1"}).start()
+    try:
+        # the client sent "6.6.6.6"; the proxy appended the address it actually saw
+        register(s, "viaproxy", headers={"X-Forwarded-For": "6.6.6.6, 198.51.100.9"})
+        ip = s.sql("SELECT last_ip FROM users WHERE username='viaproxy'")[0][0]
+        report("I4c", "behind a trusted proxy the client is the rightmost untrusted X-Forwarded-For entry, not the first",
+               "VULN" if ip != "198.51.100.9" else "ok", "last_ip=%r" % (ip,))
+        register(s, "viaproxy2", headers={"X-Forwarded-For": "198.51.100.8, 127.0.0.1"})
+        ip = s.sql("SELECT last_ip FROM users WHERE username='viaproxy2'")[0][0]
+        report("R4c", "a trusted hop at the end of the chain is skipped", "ok" if ip == "198.51.100.8" else "VULN", "last_ip=%r" % (ip,))
+        register(s, "viaproxy3", headers={"X-Forwarded-For": "8.8.8.8, not-an-ip"})
+        ip = s.sql("SELECT last_ip FROM users WHERE username='viaproxy3'")[0][0]
+        report("I4d", "a non-address in the chain is not stored", "VULN" if ip == "8.8.8.8" or ip == "not-an-ip" else "ok", "last_ip=%r" % (ip,))
+    finally:
+        s.stop()
+
+
 def check_I4b(binary, redis):
     if redis is None:
         report("I4b", "cycling X-Forwarded-For defeats the login lockout", "skip", "no redis-server")
@@ -579,6 +609,19 @@ def check_I8(binary, redis):
         report("R8", "the browser that started the flow gets past the state check (Discord itself is unreachable here)",
                "ok" if "Invalid or expired OAuth state" not in t else "VULN",
                "answer: %s" % errtext(d))
+        # single use: the same cookie and state again
+        st, _, d = s.req("GET", "/auth/callback?code=c&state=" + urllib.parse.quote(state2), {"Cookie": ck})
+        report("R8b", "a state that was used once is refused the second time",
+               "ok" if "Invalid or expired OAuth state" in text(d) else "VULN", "answer: %s" % errtext(d))
+        # login CSRF with a victim who has started a flow of their own: attacker's valid state in the URL,
+        # the victim's cookie holds a different state
+        st, h, _ = s.req("GET", "/auth/discord")                 # the attacker's flow
+        attacker_state = (urllib.parse.parse_qs(urllib.parse.urlparse(h.get("location", "")).query).get("state") or [""])[0]
+        st, h, _ = s.req("GET", "/auth/discord")                 # the victim's own flow
+        victim_cookie = "; ".join(c.split(";")[0] for c in h["set-cookie-all"])
+        st, _, d = s.req("GET", "/auth/callback?code=attackercode&state=" + urllib.parse.quote(attacker_state), {"Cookie": victim_cookie})
+        report("I8c", "the attacker's valid state is accepted although the victim's cookie holds a different state",
+               "VULN" if "Invalid or expired OAuth state" not in text(d) else "ok", "answer: %s" % errtext(d))
     finally:
         s.stop()
 
@@ -670,7 +713,7 @@ def check_I10(binary, redis):
 
 CHECKS = [
     ("I1", check_I1), ("I1b", check_I1b), ("I2a", check_I2a), ("I2b", check_I2b), ("I3", check_I3),
-    ("I4a", check_I4a), ("I4b", check_I4b), ("I5", check_I5), ("I6", check_I6), ("I7", check_I7),
+    ("I4a", check_I4a), ("I4c", check_I4c), ("I4b", check_I4b), ("I5", check_I5), ("I6", check_I6), ("I7", check_I7),
     ("I8", check_I8), ("I9", check_I9), ("I9d", check_I9d), ("I9e", check_I9e), ("I10", check_I10),
 ]
 
@@ -699,6 +742,8 @@ def main():
             if only and cid not in only:
                 continue
             try:
+                if redis:
+                    redis.cmd("FLUSHALL")   # every check starts with no lockouts and no counters
                 fn(binary, redis)
             except Refused as r:
                 report(cid, fn.__name__, "ok", "service refused to start: exit %s: %s" % (r.rc, r.log.strip()[-200:]))
