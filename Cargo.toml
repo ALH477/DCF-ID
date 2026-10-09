@@ -5,6 +5,15 @@ edition = "2021"
 authors = ["DeMoD LLC"]
 description = "DeMoD Communications Framework - Identity & Billing Service"
 license = "Proprietary"
+build = "build.rs"
+
+[lib]
+name = "dcf_id"
+path = "src/lib.rs"
+
+[[bin]]
+name = "dcf-id"
+path = "src/main.rs"
 
 [dependencies]
 # Web framework
@@ -51,6 +60,10 @@ dotenvy = "0.15"
 
 # Async utils
 futures = "0.3"
+
+[build-dependencies]
+# compiles the vendored Exsecutor gate (gate/*.c); see gate/PROVENANCE.md
+cc = "1"
 
 [profile.release]
 opt-level = 3
