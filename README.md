@@ -207,12 +207,17 @@ Every behaviour change in this revision. Callers, operators and the game servers
 - An empty `STRIPE_WEBHOOK_SECRET` is refused at startup (an empty HMAC key is a key everyone has).
 - Request bodies over 64 KiB are refused with 413 (the framework default was 2 MB).
 - Redis connections time out after 1.5 s, so an unreachable Redis degrades quickly instead of hanging requests.
+- **Argon2 runs on the blocking thread pool, not on an async worker, with at most one hash or verification per CPU in
+  flight** (login and registration alike). A request that cannot get a slot within 2 s is answered **503** with
+  `Retry-After: 2` and the page "The server is busy"; it is not queued without bound and does not count as a failed login.
+  Each hash holds about 19 MiB, so memory for hashing is bounded by about 19 MiB x the CPU count.
 - Rows whose `data_used` is outside +-2^62 (only possible from the old overflow, see below) are not touched by usage
   reports (HTTP 409). Repair them by hand after looking at them.
 
 **Callers of the internal API** (`X-Internal-Key`)
 - `/api/stats` and `/metrics` now need the key. They were open.
-- `/health` returns only `{"status": ...}`; `uptime_secs`, `redis_ok` and `version` are gone.
+- `/health` returns only `{"status": ...}`; `uptime_secs`, `redis_ok` and `version` are gone. `/metrics` gains `argon2_runs`
+  (Argon2 operations run) and `argon2_busy` (requests turned away with 503).
 - `POST /api/usage/report`: `bytes_used` above 2^40 (1 TiB) is **400** (before, `u64::MAX` wrapped to -1 and
   subtracted usage; `2^63-1` locked an account); a malformed `access_token` is 404, like an unknown one; error
   bodies no longer carry SQL error text. Billing is one atomic `UPDATE`, so a concurrent Stripe credit cannot be
@@ -224,6 +229,10 @@ Every behaviour change in this revision. Callers, operators and the game servers
 - A `checkout.session.completed` event is credited **once** (table `stripe_events`, keyed by event id and by checkout
   session id), only when `payment_status` is `paid` and the currency is USD, for Stripe's own integer `amount_total`
   (not `metadata.amount_dollars`), and only for 250..=10000 cents. A database failure answers 500 so Stripe retries.
+- An event that is ours and paid but has no checkout session id (`cs_...`) is **not credited** and is answered **400** (and
+  logged as an error). The session id is what makes "one payment, one credit" hold when Stripe delivers a payment as more
+  than one event; the event id alone cannot, because every delivery has its own. Real `checkout.session.completed` events
+  always carry `data.object.id`; this was argued from Stripe's documentation, not measured against a live account. [UNTESTED]
 - Checkout sessions now carry `metadata[user_id]` (the row id) instead of the secret access token. Events from sessions
   created before this change (access token in the metadata) are still credited.
 - `amount=NaN` is refused (it passed the old range test); the amount goes through the `admitte_summam` gate.
@@ -236,9 +245,27 @@ Every behaviour change in this revision. Callers, operators and the game servers
   the unique index is skipped (logged) if any exist, and registration checks inside the `INSERT` instead.
 - Passwords: 8..=256 bytes. Login refuses a longer one without hashing it.
 - Registration is limited to 10 attempts per address per hour (attempts that pass validation and reach the hash).
-- Login lockout: 5 failures per address per 15 minutes (as before) **and** 20 failures per username (any address,
-  case-folded) per 15 minutes. If Redis is unreachable a bounded in-process limiter (10,000 keys, per process,
-  forgotten on restart) takes over; before, an unreachable Redis meant no limit at all.
+- **Login attempts are counted before they are evaluated.** A password login takes one slot from its address (5 per
+  15 minutes, as before) and one from its username (20 per 15 minutes, from all addresses together, case-folded) with an
+  atomic increment *before* any password is hashed or compared; a request over either limit is answered "Too many attempts"
+  (the same page as before, with the seconds left) without a single Argon2 operation. A burst of N concurrent wrong logins
+  therefore pays for at most 5 verifications, however it interleaves. (Before, the lockout was read when a request started
+  and written when it ended, so all N got through; see "What was measured".) Detail:
+  - The address's slot is taken first. If the address is spent, the username's counter is not touched, so a locked address
+    cannot use up someone else's budget. If the username is spent, the address gets its slot back.
+  - A request turned away is not counted, so a flood of rejected requests cannot inflate a counter and keep a legitimate user
+    out after the flood; the window restarts at the fifth attempt, so a lockout lasts a full 15 minutes from the last guess.
+  - A correct password clears both counters (as before). Concurrent correct logins by the real user, up to 5 at once from one
+    address, all succeed; a 6th at the same instant is turned away and not counted, and retrying works at once.
+  - A "busy" 503 gives both slots back.
+  - If Redis is unreachable the same counters are kept in a bounded in-process limiter (10,000 keys, per process, forgotten on
+    restart); before, an unreachable Redis meant no limit at all. The counters are Redis scripts, so the increment, the window
+    and the turn-away are one step, and a counter that lost its expiry is repaired.
+  - What the per-username limit means for the owner: **anyone who can send 20 requests naming a user (from anywhere) keeps that
+    user out of password login for the rest of the 15 minutes, correct password or not.** That is the price of a limit that
+    stops a guesser spread over many addresses. It costs the attacker 20 requests per 15 minutes per victim; Discord sign-in
+    is unaffected. The address limit has the same shape for a shared address (a campus, a carrier NAT): 5 wrong passwords
+    from it in 15 minutes lock it, and any successful login from it clears the count, which is what keeps it usable.
 - Cookie values (`session`, `oauth_state`) and OAuth `state` are shape-checked (64 / 32 ASCII alphanumerics) before
   they are used as Redis keys.
 
@@ -274,8 +301,10 @@ Every behaviour change in this revision. Callers, operators and the game servers
   a token in the form (the template) or an `Origin` check. Not changed here.
 - `[OPEN]` The `oauth_state` and `session` cookies are not `__Host-` prefixed: a sibling subdomain you do not control can set
   them (cookie tossing). `__Host-` needs `Secure` and `Path=/`.
-- `[OPEN]` Argon2 runs on the async worker thread, and the lockout is checked before but recorded after the hash, so a burst of
-  parallel logins from one address is not stopped at five. Pre-existing.
+- `[OPEN]` A successful login clears the *address's* count (as it always did, so a shared address stays usable). An attacker with
+  a valid account of their own can interleave logins with guesses and so exceed 5 guesses per window *per address*; guesses at any
+  one victim are still capped by that username's limit of 20 (measured: `auth::tests::a_success_clears_the_address_but_not_the_username_of_someone_else`).
+  Spraying one password across many usernames from one address is therefore not stopped by the address limit alone. Pre-existing.
 - `[OPEN]` No `Content-Security-Policy` (see above).
 - `[UNTESTED]` Anything that needs Discord or Stripe themselves: the token exchange, `/users/@me`, creating a real Checkout
   session. The webhook is exercised with events signed locally; the callback is exercised only as far as the state check and,
@@ -287,15 +316,43 @@ Every behaviour change in this revision. Callers, operators and the game servers
 ### Tests
 
 ```bash
-cargo test --lib                                   # 76 tests: gate, throttles, billing, API on a real socket; needs no template
+cargo test --lib                                   # 93 tests: gate, throttles, billing, API on a real socket; needs no template
                                                    # (the Redis-backed ones run if a redis-server binary is on PATH)
 scripts/check-gate-fresh.sh                        # vendored gate == what its provenance says (re-emits if EXSECUTOR=... is set)
 python3 tests/poc/poc.py target/release/dcf-id     # black-box exploit programs against a built binary (needs the template)
 ```
 
-`tests/poc/poc.py` is the regression suite for the findings: 39 checks, each either an exploit (`I*`, `[VULN]` if it works)
-or a guard that the legitimate path still works (`R*`). Against the commit before this change (with only a compile fix and a
-scratch template) it reports 26 VULN, 13 ok; against this one, 39 ok. The template it expects is described in its header.
+`tests/poc/poc.py` is the regression suite for the findings: 41 checks, each either an exploit (`I*`, `[VULN]` if it works)
+or a guard that the legitimate path still works (`R*`). Against the commit before the first of these changes (with only a compile
+fix and a scratch template) it reports 28 VULN, 13 ok; against this one, 41 ok. The template it expects is described in its header.
+
+`tests/poc/burst.py` (with `tests/poc/harness.py`, adapted from an independent reviewer's harness) fires N concurrent logins
+from one barrier at a built binary, with and without Redis, and counts how many reached Argon2:
+
+```bash
+DCFID_BIN=target/release/dcf-id python3 tests/poc/burst.py
+```
+
+#### What was measured (one 4-CPU machine, release binary, each burst on a fresh service)
+
+Concurrent WRONG logins against one real user, one client address; "evaluated" = the page said "Invalid credentials", i.e. a
+verification ran:
+
+| burst | before (70089f1) | after |
+|---|---|---|
+| 30, Redis | 30 of 30 evaluated | 5 of 30 (server's own `argon2_runs` counter: 5) |
+| 100, Redis | 100 of 100 | 5 of 100 (counter: 5) |
+| 30, no Redis (in-process limiter) | 20 of 30 | 5 of 30 (counter: 5) |
+| 100, no Redis | 21 of 100 | 5 of 100 (counter: 5) |
+| 30 different unknown users, one address (dummy-hash path), Redis / no Redis | 25 / 9 of 30 | 5 / 5 of 30 |
+| `/health` latency during the 100 burst, Redis | 0.79 s | 0.01 s |
+
+Also measured after the change: 5 concurrent correct logins by the real user all succeed (Redis and no Redis); after them one
+wrong guess is an ordinary failure and the right password works; after 5 wrong guesses even the right password is refused;
+40 concurrent registrations from one address: 10 hash, 30 are throttled (registration already took its slot up front; only its
+hashing moved to the bounded pool). The counts are from single runs on one machine, not a throughput benchmark; the "before"
+numbers are whatever the race let through that run, the "after" 5 is the configured limit. The 503 path (every Argon2 slot busy)
+is exercised in `cargo test --lib` with a deliberately small pool, not under a measured load.
 
 ## License
 
